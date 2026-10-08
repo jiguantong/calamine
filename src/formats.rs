@@ -49,41 +49,20 @@ pub fn detect_custom_number_format(format: &str) -> CellFormat {
 }
 
 pub fn builtin_format_by_id(id: &[u8]) -> CellFormat {
-    match id {
-        // mm-dd-yy
-        b"14" |
-        // d-mmm-yy
-        b"15" |
-        // d-mmm
-        b"16" |
-        // mmm-yy
-        b"17" |
-        // h:mm AM/PM
-        b"18" |
-        // h:mm:ss AM/PM
-        b"19" |
-        // h:mm
-        b"20" |
-        // h:mm:ss
-        b"21" |
-        // m/d/yy h:mm
-        b"22" |
-        // mm:ss
-        b"45" |
-        // mmss.0
-        b"47" => CellFormat::DateTime,
-        // [h]:mm:ss
-        b"46" => CellFormat::TimeDelta,
-        _ => CellFormat::Other
-    }
+    // XLSX 的字符串 ID 与 XLS/XLSB 的数字 ID 共用分类，避免漏掉某一种读取路径。
+    std::str::from_utf8(id)
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map_or(CellFormat::Other, builtin_format_by_code)
 }
 
 /// Check if code corresponds to builtin date format
-///
-/// See `is_builtin_date_format_id`
 pub fn builtin_format_by_code(code: u16) -> CellFormat {
     match code {
-        14..=22 | 45 | 47 => CellFormat::DateTime,
+        // 27–36、50–58 是中日韩等地区的内置日期/时间格式，含中文完整日期 31。
+        // 只依据格式 ID 分类，不根据数值大小猜日期；时长 46 继续单独处理。
+        // 格式定义：https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.numberingformat
+        14..=22 | 27..=36 | 45 | 47 | 50..=58 => CellFormat::DateTime,
         46 => CellFormat::TimeDelta,
         _ => CellFormat::Other,
     }
@@ -131,6 +110,55 @@ pub fn format_excel_f64_ref(
 // convert f64 to date, if format == Date
 pub fn format_excel_f64(value: f64, format: Option<&CellFormat>, is_1904: bool) -> Data {
     format_excel_f64_ref(value, format, is_1904).into()
+}
+
+#[test]
+fn builtin_locale_datetime_formats_are_recognized_by_both_readers() {
+    for code in (27..=36).chain(50..=58) {
+        assert_eq!(
+            builtin_format_by_code(code),
+            CellFormat::DateTime,
+            "code={code}"
+        );
+        assert_eq!(
+            builtin_format_by_id(code.to_string().as_bytes()),
+            CellFormat::DateTime,
+            "id={code}"
+        );
+    }
+}
+
+#[test]
+fn builtin_numeric_and_duration_formats_keep_their_types() {
+    for code in [0, 1, 2, 9, 10, 23, 26, 37, 44, 48, 49, 59, 164] {
+        assert_eq!(
+            builtin_format_by_code(code),
+            CellFormat::Other,
+            "code={code}"
+        );
+        assert_eq!(
+            builtin_format_by_id(code.to_string().as_bytes()),
+            CellFormat::Other,
+            "id={code}"
+        );
+    }
+    assert_eq!(builtin_format_by_code(46), CellFormat::TimeDelta);
+    assert_eq!(builtin_format_by_id(b"46"), CellFormat::TimeDelta);
+}
+
+#[test]
+fn builtin_locale_dates_respect_workbook_epoch_and_time() {
+    let format = builtin_format_by_code(31);
+    for (serial, is_1904) in [(46024.5, false), (44562.5, true)] {
+        let Data::DateTime(value) = format_excel_f64(serial, Some(&format), is_1904) else {
+            panic!("日期格式不能退化为普通数字");
+        };
+        assert_eq!(value.to_ymd_hms_milli(), (2026, 1, 2, 12, 0, 0, 0));
+        let Data::DateTime(value) = format_excel_i64(serial as i64, Some(&format), is_1904) else {
+            panic!("整数日期序列号也必须按日期读取");
+        };
+        assert_eq!(value.to_ymd_hms_milli(), (2026, 1, 2, 0, 0, 0, 0));
+    }
 }
 
 /// Ported from openpyxl, MIT License
