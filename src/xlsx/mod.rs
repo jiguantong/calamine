@@ -34,6 +34,15 @@ use crate::{
 };
 pub use cells_reader::XlsxCellReader;
 
+/// XLSX 单元格样式中的数字格式；原始代码保留给调用方判断业务语义，不负责显示渲染。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NumberFormat {
+    /// Excel 内置或自定义的数字格式 ID。
+    pub id: u16,
+    /// 自定义格式的原始代码，已经完成 XML 解码；内置格式没有代码。
+    pub code: Option<String>,
+}
+
 pub(crate) type XlReader<'a, RS> = XmlReader<BufReader<ZipFile<'a, RS>>>;
 
 /// Maximum number of rows allowed in an XLSX file.
@@ -255,6 +264,7 @@ pub struct Xlsx<RS> {
     tables: Tables,
     /// Cell (number) formats
     formats: Vec<CellFormat>,
+    number_formats: Vec<Option<NumberFormat>>,
     /// 1904 datetime system
     is_1904: bool,
     /// Metadata
@@ -342,21 +352,30 @@ impl<RS: Read + Seek> Xlsx<RS> {
                     match xml.read_event_into(&mut inner_buf) {
                         Ok(Event::Start(e)) if e.local_name().as_ref() == b"numFmt" => {
                             let mut id = Vec::new();
-                            let mut format = String::new();
+                            let mut format = None;
+                            let mut has_format_code = false;
                             for a in e.attributes() {
-                                match a? {
-                                    Attribute {
-                                        key: QName(b"numFmtId"),
-                                        value: v,
-                                    } => id.extend_from_slice(&v),
-                                    Attribute {
-                                        key: QName(b"formatCode"),
-                                        value: v,
-                                    } => format = xml.decoder().decode(&v)?.into_owned(),
+                                let a = a?;
+                                match a.key {
+                                    QName(b"numFmtId") => id.extend_from_slice(&a.value),
+                                    // 格式代码中的引号和货币文本按 XML 属性解码，不能当作文字实体解析。
+                                    QName(b"formatCode") => {
+                                        has_format_code = true;
+                                        format = match a.decode_and_unescape_value(xml.decoder()) {
+                                            Ok(value) => Some(value.into_owned()),
+                                            Err(err) => {
+                                                // 数字格式是语义证据，错误只影响这条格式，不能阻断单元格值读取。
+                                                // 调用方可能没有初始化 log 门面，直接打印保证这条错误可检索。
+                                                eprintln!("[warn:xlsx-number-format] event=decode_failed error={err}");
+                                                None
+                                            }
+                                        };
+                                    }
                                     _ => (),
                                 }
                             }
-                            if !format.is_empty() {
+                            // 属性缺失不覆盖内置格式；属性存在但解码失败才登记为未知格式。
+                            if has_format_code {
                                 number_formats.insert(id, format);
                             }
                         }
@@ -370,17 +389,27 @@ impl<RS: Read + Seek> Xlsx<RS> {
                     inner_buf.clear();
                     match xml.read_event_into(&mut inner_buf) {
                         Ok(Event::Start(e)) if e.local_name().as_ref() == b"xf" => {
-                            self.formats.push(
-                                e.attributes()
-                                    .filter_map(|a| a.ok())
-                                    .find(|a| a.key == QName(b"numFmtId"))
-                                    .map_or(CellFormat::Other, |a| {
-                                        match number_formats.get(&*a.value) {
-                                            Some(fmt) => detect_custom_number_format(fmt),
-                                            None => builtin_format_by_id(&a.value),
-                                        }
-                                    }),
-                            );
+                            let id = e
+                                .attributes()
+                                .filter_map(|a| a.ok())
+                                .find(|a| a.key == QName(b"numFmtId"))
+                                .map(|a| a.value.into_owned())
+                                .unwrap_or_else(|| b"0".to_vec());
+                            // 明确解码失败的自定义格式不能回退成同 ID 的内置格式，也不能猜测日期。
+                            if matches!(number_formats.get(&id), Some(None)) {
+                                self.formats.push(CellFormat::Other);
+                                self.number_formats.push(None);
+                                continue;
+                            }
+                            let code = number_formats.get(&id).cloned().flatten();
+                            self.formats.push(match &code {
+                                Some(format) => detect_custom_number_format(format),
+                                None => builtin_format_by_id(&id),
+                            });
+                            self.number_formats.push(Some(NumberFormat {
+                                id: atoi_simd::parse(&id).unwrap_or(0),
+                                code,
+                            }));
                         }
                         Ok(Event::End(e)) if e.local_name().as_ref() == b"cellXfs" => break,
                         Ok(Event::Eof) => return Err(XlsxError::XmlEof("cellXfs")),
@@ -1598,7 +1627,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
         let is_1904 = self.is_1904;
         let strings = &self.strings;
         let formats = &self.formats;
-        XlsxCellReader::new(xml, strings, formats, is_1904)
+        XlsxCellReader::new(xml, strings, formats, &self.number_formats, is_1904)
     }
 }
 
@@ -1614,6 +1643,7 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
             zip,
             strings: Vec::new(),
             formats: Vec::new(),
+            number_formats: Vec::new(),
             is_1904: false,
             sheets: Vec::new(),
             tables: None,
@@ -3004,6 +3034,105 @@ mod tests {
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 
+    fn number_format_test_workbook(
+        styles: &str,
+        cells: &str,
+    ) -> Result<Xlsx<std::io::Cursor<Vec<u8>>>, XlsxError> {
+        // 在内存中生成完整的最小 XLSX 包，直接验证样式读取与逐格元数据，不依赖 App。
+        let parts = [
+            ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>"#.to_string()),
+            ("_rels/.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.to_string()),
+            ("xl/workbook.xml", r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#.to_string()),
+            ("xl/_rels/workbook.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#.to_string()),
+            ("xl/styles.xml", format!(r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">{styles}</styleSheet>"#)),
+            ("xl/worksheets/sheet1.xml", format!(r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{cells}</sheetData></worksheet>"#)),
+        ];
+        let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, content) in parts {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        Xlsx::new(zip.finish().unwrap())
+    }
+
+    #[test]
+    fn xlsx_number_format_metadata_preserves_default_builtin_and_custom_styles() {
+        let styles = r#"<numFmts count="2"><numFmt numFmtId="164" formatCode="&quot;元&quot;#,##0.00"/><numFmt numFmtId="165" formatCode="&quot;日期&quot;yyyy-mm-dd"/></numFmts><cellXfs count="4"><xf numFmtId="0"/><xf numFmtId="7"/><xf numFmtId="164"/><xf numFmtId="165"/></cellXfs>"#;
+        let cells = r#"<row r="1"><c r="A1"><v>12.5</v></c><c r="B1" s="1"><v>98.5</v></c><c r="C1" s="2"><v>98954863.5</v></c><c r="D1" s="3"><v>46024</v></c><c r="E1" s="99"><v>4315.19</v></c></row>"#;
+        let mut workbook = number_format_test_workbook(styles, cells).unwrap();
+        let mut reader = workbook.worksheet_cells_reader("Sheet1").unwrap();
+        assert!(reader.number_format().is_none());
+        for (column, id, code) in [
+            (0, 0, None),
+            (1, 7, None),
+            (2, 164, Some("\"元\"#,##0.00")),
+            (3, 165, Some("\"日期\"yyyy-mm-dd")),
+        ] {
+            let cell = reader.next_cell().unwrap().unwrap();
+            assert_eq!(cell.get_position(), (0, column));
+            let format = reader.number_format().unwrap();
+            assert_eq!(format.id, id);
+            assert_eq!(format.code.as_deref(), code);
+            if column == 3 {
+                assert!(matches!(cell.get_value(), DataRef::DateTime(_)));
+            } else {
+                assert!(matches!(cell.get_value(), DataRef::Float(_)));
+            }
+        }
+        let cell = reader.next_cell().unwrap().unwrap();
+        assert_eq!(cell.get_value(), &DataRef::Float(4315.19));
+        assert!(reader.number_format().is_none());
+        assert!(reader.next_cell().unwrap().is_none());
+        assert!(reader.number_format().is_none());
+    }
+
+    #[test]
+    fn xlsx_number_format_missing_code_preserves_builtin_format() {
+        // 缺少格式代码的冗余声明不能覆盖内置日期与货币格式；日期值仍须保留日期类型。
+        for id in [14, 31, 7] {
+            let styles = format!(
+                r#"<numFmts count="1"><numFmt numFmtId="{id}"/></numFmts><cellXfs count="1"><xf numFmtId="{id}"/></cellXfs>"#
+            );
+            let cells = r#"<row r="1"><c r="A1" s="0"><v>46024</v></c></row>"#;
+            let mut workbook = number_format_test_workbook(&styles, cells).unwrap();
+            let mut reader = workbook.worksheet_cells_reader("Sheet1").unwrap();
+            let cell = reader.next_cell().unwrap().unwrap();
+            if id == 7 {
+                assert_eq!(cell.get_value(), &DataRef::Float(46024.0));
+            } else {
+                assert!(
+                    matches!(cell.get_value(), DataRef::DateTime(_)),
+                    "id={id} value={:?}",
+                    cell.get_value()
+                );
+            }
+            let format = reader.number_format().unwrap();
+            assert_eq!(format.id, id);
+            assert_eq!(format.code, None);
+        }
+    }
+
+    #[test]
+    fn xlsx_number_format_invalid_entities_do_not_block_or_guess_dates() {
+        // 无效实体既可能出现在自定义 ID，也可能覆盖内置 ID；两者都必须视为未知格式。
+        let styles = r#"<numFmts count="5"><numFmt numFmtId="164" formatCode="&nbsp;#,##0.00"/><numFmt numFmtId="165" formatCode="0.00&quot;A&B&quot;"/><numFmt numFmtId="7" formatCode="&nbsp;0.00"/><numFmt numFmtId="14" formatCode="&nbsp;mm-dd-yy"/><numFmt numFmtId="166" formatCode="&quot;元&quot;#,##0.00"/></numFmts><cellXfs count="5"><xf numFmtId="164"/><xf numFmtId="165"/><xf numFmtId="7"/><xf numFmtId="14"/><xf numFmtId="166"/></cellXfs>"#;
+        let cells = r#"<row r="1"><c r="A1" s="0"><v>98954863.5</v></c><c r="B1" s="1"><v>12.5</v></c><c r="C1" s="2"><v>13.5</v></c><c r="D1" s="3"><v>46024</v></c><c r="E1" s="4"><v>14.5</v></c></row>"#;
+        let mut workbook =
+            number_format_test_workbook(styles, cells).expect("格式实体错误不能阻断工作簿读取");
+        let mut reader = workbook.worksheet_cells_reader("Sheet1").unwrap();
+        for expected in [98954863.5, 12.5, 13.5, 46024.0] {
+            let cell = reader.next_cell().unwrap().unwrap();
+            assert_eq!(cell.get_value(), &DataRef::Float(expected));
+            assert!(reader.number_format().is_none());
+        }
+        let cell = reader.next_cell().unwrap().unwrap();
+        assert_eq!(cell.get_value(), &DataRef::Float(14.5));
+        assert_eq!(
+            reader.number_format().unwrap().code.as_deref(),
+            Some("\"元\"#,##0.00")
+        );
+    }
+
     #[test]
     fn test_dimensions() {
         assert_eq!(get_row_column(b"A1").unwrap(), (0, 0));
@@ -3470,6 +3599,7 @@ mod tests {
             sheets: vec![],
             tables: None,
             formats: vec![],
+            number_formats: vec![],
             is_1904: false,
             metadata: Metadata::default(),
             #[cfg(feature = "picture")]

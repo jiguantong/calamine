@@ -14,7 +14,7 @@ use std::{
 
 use super::{
     get_attribute, get_dimension, get_row, get_row_column, read_string_with_bufs,
-    replace_cell_names, Dimensions, XlReader,
+    replace_cell_names, Dimensions, NumberFormat, XlReader,
 };
 use crate::{
     datatype::DataRef,
@@ -57,6 +57,8 @@ where
     xml: XlReader<'a, RS>,
     strings: &'a [String],
     formats: &'a [CellFormat],
+    number_formats: &'a [Option<NumberFormat>],
+    cell_number_format: Option<&'a NumberFormat>,
     is_1904: bool,
     dimensions: Dimensions,
     row_index: u32,
@@ -75,6 +77,7 @@ where
         mut xml: XlReader<'a, RS>,
         strings: &'a [String],
         formats: &'a [CellFormat],
+        number_formats: &'a [Option<NumberFormat>],
         is_1904: bool,
     ) -> Result<Self, XlsxError> {
         let mut buf = Vec::with_capacity(1024);
@@ -118,6 +121,8 @@ where
             xml,
             strings,
             formats,
+            number_formats,
+            cell_number_format: None,
             is_1904,
             dimensions,
             row_index: 0,
@@ -133,7 +138,14 @@ where
         self.dimensions
     }
 
+    /// 返回最近一次 `next_cell` 读取的单元格数字格式；没有 `s` 时使用样式零。
+    /// 样式不存在或格式解码失败时返回 `None`，单元格值仍正常读取。
+    pub fn number_format(&self) -> Option<&'a NumberFormat> {
+        self.cell_number_format
+    }
+
     pub fn next_cell(&mut self) -> Result<Option<Cell<DataRef<'a>>>, XlsxError> {
+        self.cell_number_format = None;
         loop {
             self.buf.clear();
             match self.xml.read_event_into(&mut self.buf) {
@@ -173,6 +185,9 @@ where
                     } else {
                         (self.row_index, self.col_index)
                     };
+                    let style_index = style_attr
+                        .and_then(|value| atoi_simd::parse::<usize>(value).ok())
+                        .unwrap_or(0);
                     let mut value = DataRef::Empty;
                     loop {
                         self.cell_buf.clear();
@@ -199,6 +214,10 @@ where
                         }
                     }
                     self.col_index += 1;
+                    self.cell_number_format = self
+                        .number_formats
+                        .get(style_index)
+                        .and_then(Option::as_ref);
                     return Ok(Some(Cell::new(pos, value)));
                 }
                 Ok(Event::End(e)) if e.local_name().as_ref() == b"sheetData" => {
